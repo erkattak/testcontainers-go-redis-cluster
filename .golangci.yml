@@ -1,0 +1,43 @@
+version: "2"
+run:
+  concurrency: 4
+  issues-exit-code: 1
+  tests: true
+linters:
+  # default: none
+  exclusions:
+    generated: lax
+    presets:
+      # - comments
+      # - common-false-positives
+      # - legacy
+      # - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/daixiang0/gci)
+      no-inline-comments: false
+      no-prefix-comments: false
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/daixiang0/gci
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
