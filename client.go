@@ -3,12 +3,10 @@ package rediscluster
 import (
 	"context"
 	"net"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // Addrs returns the host-accessible addresses for all cluster nodes.
-func (c *RedisClusterContainer) Addrs() []string {
+func (c *Container) Addrs() []string {
 	seen := make(map[string]bool)
 	var addrs []string
 	for _, hostAddr := range c.portMap {
@@ -20,31 +18,14 @@ func (c *RedisClusterContainer) Addrs() []string {
 	return addrs
 }
 
-// ClusterOptions returns a *redis.ClusterOptions pre-configured with host-mapped
-// addresses and a NAT-rewriting dialer. The dialer intercepts connections to
-// internal Docker addresses (announced by Redis cluster nodes) and rewrites
-// them to the corresponding host-mapped ports.
-func (c *RedisClusterContainer) ClusterOptions() *redis.ClusterOptions {
-	dialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
+// NewDialer returns a dialer that rewrites internal Docker addresses (announced
+// by Redis cluster nodes) to their corresponding host-mapped ports. Pass this
+// dialer to your Redis client so it can connect from outside Docker.
+func (c *Container) NewDialer() func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if mapped, ok := c.portMap[addr]; ok {
 			addr = mapped
 		}
 		return (&net.Dialer{}).DialContext(ctx, network, addr)
 	}
-
-	opts := &redis.ClusterOptions{
-		Addrs:        c.Addrs(),
-		Dialer:       dialer,
-		MaxRedirects: 3,
-	}
-	if c.opts.password != "" {
-		opts.Password = c.opts.password
-	}
-	return opts
-}
-
-// NewClusterClient is a convenience method that returns a connected
-// *redis.ClusterClient with the NAT-rewriting dialer pre-configured.
-func (c *RedisClusterContainer) NewClusterClient() *redis.ClusterClient {
-	return redis.NewClusterClient(c.ClusterOptions())
 }

@@ -9,19 +9,19 @@ import (
 )
 
 type options struct {
-	masters                  int
-	replicasPerMaster        int
-	image                    string
-	password                 string
-	clusterNodeTimeout       time.Duration
-	appendOnly               bool
-	maxMemory                string
-	maxMemoryPolicy          string
-	logLevel                 string
-	allowReadsWhenDown       bool
-	allowWritesWhenDown      bool
-	requireFullCoverage      bool
-	replicaNoFailover        bool
+	masters             int
+	replicasPerMaster   int
+	image               string
+	password            string
+	clusterNodeTimeout  time.Duration
+	appendOnly          bool
+	maxMemory           string
+	maxMemoryPolicy     string
+	logLevel            string
+	allowReadsWhenDown  bool
+	allowWritesWhenDown bool
+	requireFullCoverage bool
+	replicaNoFailover   bool
 }
 
 func defaultOptions() options {
@@ -98,11 +98,6 @@ func WithMasters(n int) testcontainers.ContainerCustomizer {
 // WithReplicasPerMaster sets the number of replicas per master node.
 func WithReplicasPerMaster(n int) testcontainers.ContainerCustomizer {
 	return clusterOption{apply: func(o *options) { o.replicasPerMaster = n }}
-}
-
-// WithImage overrides the Docker image used for the Redis cluster container.
-func WithImage(image string) testcontainers.ContainerCustomizer {
-	return clusterOption{apply: func(o *options) { o.image = image }}
 }
 
 // WithPassword sets the Redis AUTH password for all cluster nodes.

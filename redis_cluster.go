@@ -18,18 +18,18 @@ import (
 
 const initialPort = 7000
 
-
-// RedisClusterContainer represents a running Redis cluster in a single Docker container.
-type RedisClusterContainer struct {
+// Container represents a running Redis cluster in a single Docker container.
+type Container struct {
 	testcontainers.Container
 	opts      options
 	portMap   map[string]string // "containerIP:7000" -> "host:XXXXX"
 	nodeCount int
 }
 
-// RunContainer starts a Redis cluster container with the given options.
-func RunContainer(ctx context.Context, opts ...testcontainers.ContainerCustomizer) (*RedisClusterContainer, error) {
+// Run starts a Redis cluster container using the given image and options.
+func Run(ctx context.Context, img string, opts ...testcontainers.ContainerCustomizer) (*Container, error) {
 	o := defaultOptions()
+	o.image = img
 
 	var containerCustomizers []testcontainers.ContainerCustomizer
 	for _, opt := range opts {
@@ -106,7 +106,7 @@ func RunContainer(ctx context.Context, opts ...testcontainers.ContainerCustomize
 		portMap[fmt.Sprintf("127.0.0.1:%d", port)] = hostAddr
 	}
 
-	return &RedisClusterContainer{
+	return &Container{
 		Container: container,
 		opts:      o,
 		portMap:   portMap,

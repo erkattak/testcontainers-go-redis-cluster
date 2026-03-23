@@ -13,7 +13,7 @@ import (
 // If pendingDuration > 0, the node will automatically restart after that duration.
 // The returned restartFn can be called to restart the node immediately;
 // it is idempotent — calling it multiple times or after auto-restart is safe.
-func (c *RedisClusterContainer) StopNode(ctx context.Context, id int, pendingDuration time.Duration) (restartFn func() error, err error) {
+func (c *Container) StopNode(ctx context.Context, id int, pendingDuration time.Duration) (restartFn func() error, err error) {
 	if id < 0 || id >= c.nodeCount {
 		return nil, fmt.Errorf("node id %d out of range [0, %d)", id, c.nodeCount)
 	}
@@ -41,7 +41,7 @@ func (c *RedisClusterContainer) StopNode(ctx context.Context, id int, pendingDur
 // freezing it without closing connections. If pendingDuration > 0, the node will
 // automatically resume after that duration. The returned resumeFn can be called to
 // resume immediately; it is idempotent.
-func (c *RedisClusterContainer) PauseNode(ctx context.Context, id int, pendingDuration time.Duration) (resumeFn func() error, err error) {
+func (c *Container) PauseNode(ctx context.Context, id int, pendingDuration time.Duration) (resumeFn func() error, err error) {
 	if id < 0 || id >= c.nodeCount {
 		return nil, fmt.Errorf("node id %d out of range [0, %d)", id, c.nodeCount)
 	}
@@ -79,7 +79,7 @@ func onceFunc(fn func() error, autoDuration time.Duration) func() error {
 }
 
 // redisPID returns the PID of the redis-server process listening on the given port.
-func (c *RedisClusterContainer) redisPID(ctx context.Context, port int) (string, error) {
+func (c *Container) redisPID(ctx context.Context, port int) (string, error) {
 	args := []string{"sh", "-c", fmt.Sprintf("redis-cli -p %d info server | grep process_id | cut -d: -f2 | tr -d '\\r'", port)}
 	_, reader, err := c.Exec(ctx, args)
 	if err != nil {
