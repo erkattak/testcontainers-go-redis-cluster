@@ -16,6 +16,7 @@ type NodeInfo struct {
 	ExternalAddr string // Host-accessible address (host:mappedPort)
 	InitialRole  string // "master" or "replica" based on startup configuration
 	CurrentRole  string // "master" or "replica" based on current topology (only set by CurrentNodes)
+	Flags        string // Raw flags from CLUSTER NODES (e.g., "master,fail") (only set by CurrentNodes)
 }
 
 // Nodes returns information about all cluster nodes. Note that the returned
@@ -48,11 +49,148 @@ func (c *Container) Nodes() []NodeInfo {
 // information with CurrentRole populated based on the live cluster state.
 // Unlike Nodes(), this method reflects topology changes from failovers.
 func (c *Container) CurrentNodes(ctx context.Context) ([]NodeInfo, error) {
-	// Try each node until one responds, since some nodes may be down.
+	// Try each node until one responds, since some nodes may be down or paused.
 	var output []byte
 	var lastErr error
 	for i := range c.nodeCount {
-		args := []string{"redis-cli", "-p", fmt.Sprintf("%d", initialPort+i)}
+		var err error
+		output, err = c.clusterNodes(ctx, initialPort+i)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		lastErr = nil
+		break
+	}
+	if lastErr != nil {
+		return nil, fmt.Errorf("all nodes failed, last error: %w", lastErr)
+	}
+
+	return c.parseClusterNodes(output), nil
+}
+
+// clusterNodes runs CLUSTER NODES on the specified node and returns the raw output.
+// We use a short timeout to avoid blocking on unresponsive nodes.
+func (c *Container) clusterNodes(ctx context.Context, port int) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	args := []string{"redis-cli", "-t", "1", "-p", fmt.Sprintf("%d", port)}
+	if c.opts.password != "" {
+		args = append(args, "-a", c.opts.password)
+	}
+	args = append(args, "CLUSTER", "NODES")
+
+	code, reader, err := c.Exec(ctx, args)
+	if err != nil || code != 0 {
+		return nil, fmt.Errorf("running CLUSTER NODES (port: %d)", port)
+	}
+
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("reading output (port: %d): %w", port, err)
+	}
+
+	return output, nil
+}
+
+// parseClusterNodes parses CLUSTER NODES output and builds NodeInfo slice.
+func (c *Container) parseClusterNodes(output []byte) []NodeInfo {
+	// Parse CLUSTER NODES output to get current roles and flags.
+	// Format: <id> <ip:port@cport> <flags> ...
+	// Flags contain "master" or "slave" (replica), plus status like "fail" or "fail?".
+	type nodeState struct {
+		role  string
+		flags string
+	}
+	states := make(map[string]nodeState) // internal addr -> state
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		// addr is "ip:port@cport", extract "ip:port"
+		addrPart := strings.Split(fields[1], "@")[0]
+		flags := fields[2]
+
+		role := "replica"
+		if strings.Contains(flags, "master") {
+			role = "master"
+		}
+		states[addrPart] = nodeState{role: role, flags: flags}
+	}
+
+	// Build NodeInfo slice with current roles and flags.
+	nodes := make([]NodeInfo, c.nodeCount)
+	for i := range c.nodeCount {
+		port := initialPort + i
+		internalAddr := fmt.Sprintf("127.0.0.1:%d", port)
+
+		initialRole := "master"
+		if i >= c.opts.masters {
+			initialRole = "replica"
+		}
+
+		state := states[internalAddr]
+		nodes[i] = NodeInfo{
+			Index:        i,
+			InternalAddr: internalAddr,
+			ExternalAddr: c.portMap[internalAddr],
+			InitialRole:  initialRole,
+			CurrentRole:  state.role,
+			Flags:        state.flags,
+		}
+	}
+	return nodes
+}
+
+// MasterNodes returns information about current master nodes in the cluster.
+// This is a convenience wrapper around CurrentNodes() that filters by CurrentRole.
+func (c *Container) MasterNodes(ctx context.Context) ([]NodeInfo, error) {
+	nodes, err := c.CurrentNodes(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	masters := make([]NodeInfo, 0, len(nodes))
+	for _, n := range nodes {
+		if n.CurrentRole == "master" {
+			masters = append(masters, n)
+		}
+	}
+	return masters, nil
+}
+
+// IsNodeFailed queries cluster topology and returns true if the specified node
+// is marked as fail or pfail (fail?) by other nodes in the cluster.
+// It queries from a different node than the target to avoid blocking on the target.
+func (c *Container) IsNodeFailed(ctx context.Context, nodeID int) (bool, error) {
+	if nodeID < 0 || nodeID >= c.nodeCount {
+		return false, fmt.Errorf("node id %d out of range [0, %d)", nodeID, c.nodeCount)
+	}
+
+	nodes, err := c.currentNodesExcluding(ctx, nodeID)
+	if err != nil {
+		return false, err
+	}
+
+	for _, n := range nodes {
+		if n.Index == nodeID {
+			return strings.Contains(n.Flags, "fail"), nil
+		}
+	}
+	return false, fmt.Errorf("node %d not found in cluster topology", nodeID)
+}
+
+// currentNodesExcluding is like CurrentNodes but skips the specified node when querying.
+func (c *Container) currentNodesExcluding(ctx context.Context, excludeNodeID int) ([]NodeInfo, error) {
+	var output []byte
+	var lastErr error
+	for i := range c.nodeCount {
+		if i == excludeNodeID {
+			continue
+		}
+		args := []string{"redis-cli", "-t", "2", "-p", fmt.Sprintf("%d", initialPort+i)}
 		if c.opts.password != "" {
 			args = append(args, "-a", c.opts.password)
 		}
@@ -76,63 +214,7 @@ func (c *Container) CurrentNodes(ctx context.Context) ([]NodeInfo, error) {
 		return nil, fmt.Errorf("all nodes failed, last error: %w", lastErr)
 	}
 
-	// Parse CLUSTER NODES output to get current roles.
-	// Format: <id> <ip:port@cport> <flags> ...
-	// Flags contain "master" or "slave" (replica).
-	roles := make(map[string]string) // internal addr -> role
-	for _, line := range strings.Split(string(output), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 3 {
-			continue
-		}
-		// addr is "ip:port@cport", extract "ip:port"
-		addrPart := strings.Split(fields[1], "@")[0]
-		flags := fields[2]
-
-		role := "replica"
-		if strings.Contains(flags, "master") {
-			role = "master"
-		}
-		roles[addrPart] = role
-	}
-
-	// Build NodeInfo slice with current roles.
-	nodes := make([]NodeInfo, c.nodeCount)
-	for i := range c.nodeCount {
-		port := initialPort + i
-		internalAddr := fmt.Sprintf("127.0.0.1:%d", port)
-
-		initialRole := "master"
-		if i >= c.opts.masters {
-			initialRole = "replica"
-		}
-
-		nodes[i] = NodeInfo{
-			Index:        i,
-			InternalAddr: internalAddr,
-			ExternalAddr: c.portMap[internalAddr],
-			InitialRole:  initialRole,
-			CurrentRole:  roles[internalAddr],
-		}
-	}
-	return nodes, nil
-}
-
-// MasterNodes returns information about current master nodes in the cluster.
-// This is a convenience wrapper around CurrentNodes() that filters by CurrentRole.
-func (c *Container) MasterNodes(ctx context.Context) ([]NodeInfo, error) {
-	nodes, err := c.CurrentNodes(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	masters := make([]NodeInfo, 0, len(nodes))
-	for _, n := range nodes {
-		if n.CurrentRole == "master" {
-			masters = append(masters, n)
-		}
-	}
-	return masters, nil
+	return c.parseClusterNodes(output), nil
 }
 
 // ReplicaForMaster returns the node index of a replica that replicates the given
@@ -179,7 +261,8 @@ func (c *Container) findReplicaForMaster(ctx context.Context, masterIndex int) (
 	var output []byte
 	var lastErr error
 	for i := range c.nodeCount {
-		args := []string{"redis-cli", "-p", fmt.Sprintf("%d", initialPort+i)}
+		// Use a short timeout (-t) so we don't block on paused/unresponsive nodes.
+		args := []string{"redis-cli", "-t", "2", "-p", fmt.Sprintf("%d", initialPort+i)}
 		if c.opts.password != "" {
 			args = append(args, "-a", c.opts.password)
 		}

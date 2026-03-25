@@ -89,9 +89,24 @@ func (c *Container) redisPID(ctx context.Context, port int) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("reading PID output: %w", err)
 	}
-	pid := strings.TrimSpace(string(b))
+	// Extract only numeric characters from the output.
+	// Docker exec output may contain multiplexed stream headers (binary garbage)
+	// that need to be stripped to get the actual PID value.
+	pid := extractNumericPID(string(b))
 	if pid == "" || pid == "0" {
 		return "", fmt.Errorf("could not find PID for redis-server on port %d", port)
 	}
 	return pid, nil
+}
+
+// extractNumericPID extracts only numeric characters from the output,
+// filtering out any Docker exec multiplexed stream headers.
+func extractNumericPID(s string) string {
+	var result strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			result.WriteRune(r)
+		}
+	}
+	return result.String()
 }

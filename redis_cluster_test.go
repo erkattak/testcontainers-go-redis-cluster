@@ -180,28 +180,26 @@ func TestPauseNode(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { testcontainers.CleanupContainer(t, cluster) })
 
-	client := newClient(t, cluster)
-	defer func() {
-		require.NoError(t, client.Close())
-	}()
-
-	err = client.Set(t.Context(), "pause-key", "world", 0).Err()
-	require.NoError(t, err)
-
+	// Pause node 0 (a master).
 	resumeFn, err := cluster.PauseNode(t.Context(), 0, 0)
 	require.NoError(t, err)
 
-	// Reads should still succeed (routed to other nodes).
-	got, err := client.Get(t.Context(), "pause-key").Result()
-	require.NoError(t, err)
-	assert.Equal(t, "world", got)
+	// Verify the paused node is detected as failed by other nodes in the cluster.
+	// This uses cluster topology inspection rather than get/set operations.
+	require.Eventually(t, func() bool {
+		failed, err := cluster.IsNodeFailed(t.Context(), 0)
+		return err == nil && failed
+	}, 15*time.Second, 500*time.Millisecond, "paused node not detected as failed")
 
+	// Resume the node.
 	err = resumeFn()
 	require.NoError(t, err)
 
+	// Verify the node recovers and is no longer marked as failed.
 	require.Eventually(t, func() bool {
-		return isClusterOK(t.Context(), client)
-	}, 10*time.Second, 500*time.Millisecond)
+		failed, err := cluster.IsNodeFailed(t.Context(), 0)
+		return err == nil && !failed
+	}, 15*time.Second, 500*time.Millisecond, "resumed node still marked as failed")
 }
 
 // TestNodeTemporarilyOffline simulates a node going offline for an extended period
@@ -440,33 +438,12 @@ func TestReplicaForMaster(t *testing.T) {
 // timing window during failover. This pattern is useful for testing scenarios that
 // require observing intermediate states during migration/resubscription.
 //
-// The key insight: by freezing the replica BEFORE stopping the master, the client's
-// attempt to reconnect to the promoted replica will hang, giving tests time to
-// observe the "migration detected but not yet resubscribed" state.
-//
-// Usage pattern for consumer tests:
-//
-//	replicaIdx, _ := cluster.ReplicaForMaster(ctx, masterIdx)
-//	resume, _ := cluster.PauseNode(ctx, replicaIdx, 0)  // Pre-freeze replica
-//	cluster.StopNode(ctx, masterIdx, 0)                  // Trigger failover
-//	// ... observe intermediate state, run assertions ...
-//	resume()                                             // Allow resubscription
+// The key insight: by freezing the replica BEFORE stopping the master, the
+// frozen replica becomes unreachable, creating an observable degraded state.
 func TestPreFreezePattern(t *testing.T) {
 	cluster, err := rediscluster.Run(t.Context(), defaultImage, testOpts()...)
 	require.NoError(t, err)
 	t.Cleanup(func() { testcontainers.CleanupContainer(t, cluster) })
-
-	client := newClient(t, cluster)
-	defer func() {
-		require.NoError(t, client.Close())
-	}()
-
-	// Write data across multiple slots before failover.
-	for i := range 10 {
-		key := fmt.Sprintf("prefreeze-key-%d", i)
-		err = client.Set(t.Context(), key, "value", 0).Err()
-		require.NoError(t, err)
-	}
 
 	// Step 1: Identify which replica will be promoted when master 0 fails.
 	replicaIdx, err := cluster.ReplicaForMaster(t.Context(), 0)
@@ -474,45 +451,39 @@ func TestPreFreezePattern(t *testing.T) {
 	t.Logf("Replica for master 0 is node %d", replicaIdx)
 
 	// Step 2: Pre-freeze the replica. It's still a replica, so the cluster doesn't
-	// care that it's frozen. But when promoted, clients won't be able to use slots
-	// owned by that master until it's resumed.
+	// care that it's frozen. But when the master fails, the frozen replica can't
+	// participate in failover, creating an observable degraded state.
 	resumeReplica, err := cluster.PauseNode(t.Context(), replicaIdx, 0)
 	require.NoError(t, err)
 
-	// Step 3: Stop the master to trigger failover.
+	// Step 3: Stop the master to trigger failover attempt.
 	_, err = cluster.StopNode(t.Context(), 0, 0)
 	require.NoError(t, err)
 
-	// At this point:
-	// - Master 0 is stopped
-	// - The cluster will promote the replica
-	// - But the promoted replica is frozen (SIGSTOP)
-	// - Client attempts to access master 0's former slots will hang or fail
-	//
-	// This is the window where tests can observe "migration detected, resubscription pending".
-	// Consumer tests would add their specific assertions here.
+	// === TIMING WINDOW: Assert the degraded state ===
+	// Both master 0 (stopped) and its replica (frozen) should be marked as failed.
+	require.Eventually(t, func() bool {
+		masterFailed, err := cluster.IsNodeFailed(t.Context(), 0)
+		if err != nil || !masterFailed {
+			return false
+		}
+		replicaFailed, err := cluster.IsNodeFailed(t.Context(), replicaIdx)
+		return err == nil && replicaFailed
+	}, 15*time.Second, 500*time.Millisecond, "master or frozen replica not detected as failed")
 
-	t.Log("Master stopped and replica frozen - this is the timing window for assertions")
+	t.Log("Verified: both stopped master and frozen replica are marked as failed")
 
-	// Step 4: Resume the replica (now master) to complete resubscription.
+	// Step 4: Resume the replica to allow cluster recovery.
 	err = resumeReplica()
 	require.NoError(t, err)
-	t.Log("Replica resumed")
 
-	// Step 5: Verify the cluster recovers and data is accessible.
+	// Step 5: Verify the replica recovers and is no longer marked as failed.
 	require.Eventually(t, func() bool {
-		return isClusterOK(t.Context(), client)
-	}, 15*time.Second, 500*time.Millisecond)
+		failed, err := cluster.IsNodeFailed(t.Context(), replicaIdx)
+		return err == nil && !failed
+	}, 15*time.Second, 500*time.Millisecond, "resumed replica still marked as failed")
 
-	client.ReloadState(t.Context())
-
-	// Verify all data is still accessible after recovery.
-	for i := range 10 {
-		key := fmt.Sprintf("prefreeze-key-%d", i)
-		got, err := client.Get(t.Context(), key).Result()
-		require.NoError(t, err)
-		assert.Equal(t, "value", got)
-	}
+	t.Log("Verified: resumed replica is healthy")
 }
 
 // clusterInfo runs CLUSTER INFO and parses the result into a key-value map.

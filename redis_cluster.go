@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/go-connections/nat"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -60,6 +61,10 @@ func Run(ctx context.Context, img string, opts ...testcontainers.ContainerCustom
 			ExposedPorts: exposedPorts,
 			Cmd:          []string{"sleep", "infinity"},
 			WaitingFor:   wait.ForExec([]string{"echo", "ready"}),
+			HostConfigModifier: func(hc *container.HostConfig) {
+				init := true
+				hc.Init = &init
+			},
 		},
 		Started: true,
 	}
