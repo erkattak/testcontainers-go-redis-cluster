@@ -267,6 +267,124 @@ func TestNodeTemporarilyOffline(t *testing.T) {
 	}
 }
 
+func TestNodes(t *testing.T) {
+	opts := append(testOpts(),
+		rediscluster.WithMasters(3),
+		rediscluster.WithReplicasPerMaster(2),
+	)
+	cluster, err := rediscluster.Run(t.Context(), defaultImage, opts...)
+	require.NoError(t, err)
+	t.Cleanup(func() { testcontainers.CleanupContainer(t, cluster) })
+
+	nodes := cluster.Nodes()
+	assert.Len(t, nodes, 9) // 3 masters + 6 replicas
+
+	// Verify node indices and roles
+	for i, node := range nodes {
+		assert.Equal(t, i, node.Index)
+		assert.Contains(t, node.InternalAddr, fmt.Sprintf("127.0.0.1:700%d", i))
+		assert.NotEmpty(t, node.ExternalAddr)
+
+		if i < 3 {
+			assert.Equal(t, "master", node.InitialRole)
+		} else {
+			assert.Equal(t, "replica", node.InitialRole)
+		}
+	}
+
+	// Verify external addresses are reachable via the client
+	client := newClient(t, cluster)
+	defer func() {
+		require.NoError(t, client.Close())
+	}()
+
+	pong, err := client.Ping(t.Context()).Result()
+	require.NoError(t, err)
+	assert.Equal(t, "PONG", pong)
+}
+
+func TestCurrentNodes(t *testing.T) {
+	cluster, err := rediscluster.Run(t.Context(), defaultImage, testOpts()...)
+	require.NoError(t, err)
+	t.Cleanup(func() { testcontainers.CleanupContainer(t, cluster) })
+
+	// Initially, CurrentRole should match InitialRole
+	nodes, err := cluster.CurrentNodes(t.Context())
+	require.NoError(t, err)
+	assert.Len(t, nodes, 6) // 3 masters + 3 replicas
+
+	masters := 0
+	replicas := 0
+	for _, node := range nodes {
+		assert.Equal(t, node.InitialRole, node.CurrentRole)
+		if node.CurrentRole == "master" {
+			masters++
+		} else {
+			replicas++
+		}
+	}
+	assert.Equal(t, 3, masters)
+	assert.Equal(t, 3, replicas)
+}
+
+func TestCurrentNodes_AfterFailover(t *testing.T) {
+	cluster, err := rediscluster.Run(t.Context(), defaultImage, testOpts()...)
+	require.NoError(t, err)
+	t.Cleanup(func() { testcontainers.CleanupContainer(t, cluster) })
+
+	client := newClient(t, cluster)
+	defer func() {
+		require.NoError(t, client.Close())
+	}()
+
+	// Stop node 0 (a master) to trigger failover
+	_, err = cluster.StopNode(t.Context(), 0, 0)
+	require.NoError(t, err)
+
+	// Wait for failover to complete
+	require.Eventually(t, func() bool {
+		return isClusterOK(t.Context(), client)
+	}, 15*time.Second, 500*time.Millisecond)
+
+	// Now check topology - a replica should have been promoted
+	nodes, err := cluster.CurrentNodes(t.Context())
+	require.NoError(t, err)
+
+	// At least one node should have CurrentRole != InitialRole (the promoted replica)
+	promoted := false
+	for _, node := range nodes {
+		if node.InitialRole == "replica" && node.CurrentRole == "master" {
+			promoted = true
+			break
+		}
+	}
+	assert.True(t, promoted, "expected a replica to be promoted to master")
+}
+
+func TestAddrMapping(t *testing.T) {
+	cluster, err := rediscluster.Run(t.Context(), defaultImage, testOpts()...)
+	require.NoError(t, err)
+	t.Cleanup(func() { testcontainers.CleanupContainer(t, cluster) })
+
+	mapping := cluster.AddrMapping()
+
+	// Default config: 3 masters + 3 replicas = 6 nodes
+	// Each node has 2 entries (containerIP:port and 127.0.0.1:port)
+	assert.Len(t, mapping, 12)
+
+	// Verify 127.0.0.1 entries exist for all ports
+	for i := range 6 {
+		key := fmt.Sprintf("127.0.0.1:700%d", i)
+		assert.Contains(t, mapping, key)
+		assert.NotEmpty(t, mapping[key])
+	}
+
+	// Verify mutation safety - modifying returned map doesn't affect container
+	mapping["test"] = "value"
+	mapping2 := cluster.AddrMapping()
+	assert.NotContains(t, mapping2, "test")
+}
+
 // clusterInfo runs CLUSTER INFO and parses the result into a key-value map.
 func clusterInfo(t *testing.T, client *redis.ClusterClient) map[string]string {
 	t.Helper()
