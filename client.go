@@ -117,6 +117,23 @@ func (c *Container) CurrentNodes(ctx context.Context) ([]NodeInfo, error) {
 	return nodes, nil
 }
 
+// MasterNodes returns information about current master nodes in the cluster.
+// This is a convenience wrapper around CurrentNodes() that filters by CurrentRole.
+func (c *Container) MasterNodes(ctx context.Context) ([]NodeInfo, error) {
+	nodes, err := c.CurrentNodes(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	masters := make([]NodeInfo, 0, len(nodes))
+	for _, n := range nodes {
+		if n.CurrentRole == "master" {
+			masters = append(masters, n)
+		}
+	}
+	return masters, nil
+}
+
 // AddrMapping returns a map from internal addresses (as announced by Redis)
 // to their corresponding host-accessible external addresses.
 func (c *Container) AddrMapping() map[string]string {
@@ -125,6 +142,14 @@ func (c *Container) AddrMapping() map[string]string {
 		m[k] = v
 	}
 	return m
+}
+
+// MapAddress translates an internal Redis cluster address (as returned by
+// CLUSTER SLOTS or CLUSTER NODES) to the corresponding external host-accessible
+// address. Returns the original address and false if no mapping exists.
+func (c *Container) MapAddress(addr string) (string, bool) {
+	external, ok := c.portMap[addr]
+	return external, ok
 }
 
 // Addrs returns the host-accessible addresses for all cluster nodes.

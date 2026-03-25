@@ -361,6 +361,35 @@ func TestCurrentNodes_AfterFailover(t *testing.T) {
 	assert.True(t, promoted, "expected a replica to be promoted to master")
 }
 
+func TestMasterNodes(t *testing.T) {
+	cluster, err := rediscluster.Run(t.Context(), defaultImage, testOpts()...)
+	require.NoError(t, err)
+	t.Cleanup(func() { testcontainers.CleanupContainer(t, cluster) })
+
+	masters, err := cluster.MasterNodes(t.Context())
+	require.NoError(t, err)
+	assert.Len(t, masters, 3) // Default: 3 masters
+
+	for _, m := range masters {
+		assert.Equal(t, "master", m.CurrentRole)
+	}
+}
+
+func TestMapAddress(t *testing.T) {
+	cluster, err := rediscluster.Run(t.Context(), defaultImage, testOpts()...)
+	require.NoError(t, err)
+	t.Cleanup(func() { testcontainers.CleanupContainer(t, cluster) })
+
+	// Valid internal address should map
+	external, ok := cluster.MapAddress("127.0.0.1:7000")
+	assert.True(t, ok)
+	assert.NotEmpty(t, external)
+
+	// Unknown address returns false
+	_, ok = cluster.MapAddress("unknown:1234")
+	assert.False(t, ok)
+}
+
 func TestAddrMapping(t *testing.T) {
 	cluster, err := rediscluster.Run(t.Context(), defaultImage, testOpts()...)
 	require.NoError(t, err)
