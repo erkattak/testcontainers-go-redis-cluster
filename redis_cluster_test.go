@@ -16,24 +16,43 @@ import (
 
 const defaultImage = "redis:alpine"
 
+func testOpts() []testcontainers.ContainerCustomizer {
+	return []testcontainers.ContainerCustomizer{
+		rediscluster.WithoutClusterRequireFullCoverage(),
+		rediscluster.WithClusterAllowReadsWhenDown(),
+		rediscluster.WithClusterReplicaValidityFactor(0),
+		rediscluster.WithClusterNodeTimeout(time.Second),
+		rediscluster.WithClusterMigrationBarrier(1),
+	}
+}
+
 func newClient(t *testing.T, c *rediscluster.Container) *redis.ClusterClient {
 	t.Helper()
 	return redis.NewClusterClient(&redis.ClusterOptions{
-		Addrs:        c.Addrs(),
-		Dialer:       c.NewDialer(),
-		MaxRedirects: 3,
-		MaxRetries:   3,
+		Addrs:           c.Addrs(),
+		Dialer:          c.NewDialer(),
+		MaxRedirects:    3,
+		MaxRetries:      3,
+		DialTimeout:     500 * time.Millisecond,
+		ReadTimeout:     500 * time.Millisecond,
+		WriteTimeout:    500 * time.Millisecond,
+		MinRetryBackoff: 50 * time.Millisecond,
+		MaxRetryBackoff: 250 * time.Millisecond,
 	})
 }
 
-// isClusterOK returns true when the cluster reports cluster_state:ok.
+// isClusterOK returns true when the cluster reports cluster_state:ok AND all
+// 16384 hash slots are healthy. The slot check is necessary because with
+// cluster-require-full-coverage no, Redis reports cluster_state:ok even when
+// some slots are unassigned (i.e. before failover completes).
 // Safe to use inside require.Eventually (no t.Fatal calls).
 func isClusterOK(ctx context.Context, client *redis.ClusterClient) bool {
 	result, err := client.ClusterInfo(ctx).Result()
 	if err != nil {
 		return false
 	}
-	return strings.Contains(result, "cluster_state:ok")
+	return strings.Contains(result, "cluster_state:ok") &&
+		strings.Contains(result, "cluster_slots_ok:16384")
 }
 
 func TestRun_Defaults(t *testing.T) {
@@ -56,10 +75,11 @@ func TestRun_Defaults(t *testing.T) {
 }
 
 func TestRun_CustomTopology(t *testing.T) {
-	cluster, err := rediscluster.Run(t.Context(), defaultImage,
+	opts := append(testOpts(),
 		rediscluster.WithMasters(3),
 		rediscluster.WithReplicasPerMaster(2),
 	)
+	cluster, err := rediscluster.Run(t.Context(), defaultImage, opts...)
 	require.NoError(t, err)
 	t.Cleanup(func() { testcontainers.CleanupContainer(t, cluster) })
 
@@ -85,7 +105,7 @@ func TestParallelIsolation(t *testing.T) {
 		t.Run(fmt.Sprintf("cluster-%d", i), func(t *testing.T) {
 			t.Parallel()
 
-			cluster, err := rediscluster.Run(t.Context(), defaultImage)
+			cluster, err := rediscluster.Run(t.Context(), defaultImage, testOpts()...)
 			require.NoError(t, err)
 			t.Cleanup(func() { testcontainers.CleanupContainer(t, cluster) })
 
@@ -108,7 +128,7 @@ func TestParallelIsolation(t *testing.T) {
 }
 
 func TestStopNode_AutoRestart(t *testing.T) {
-	cluster, err := rediscluster.Run(t.Context(), defaultImage)
+	cluster, err := rediscluster.Run(t.Context(), defaultImage, testOpts()...)
 	require.NoError(t, err)
 	t.Cleanup(func() { testcontainers.CleanupContainer(t, cluster) })
 
@@ -131,11 +151,11 @@ func TestStopNode_AutoRestart(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		return isClusterOK(t.Context(), client)
-	}, 30*time.Second, 1*time.Second)
+	}, 15*time.Second, 500*time.Millisecond)
 }
 
 func TestStopNode_ManualRestart(t *testing.T) {
-	cluster, err := rediscluster.Run(t.Context(), defaultImage)
+	cluster, err := rediscluster.Run(t.Context(), defaultImage, testOpts()...)
 	require.NoError(t, err)
 	t.Cleanup(func() { testcontainers.CleanupContainer(t, cluster) })
 
@@ -152,11 +172,11 @@ func TestStopNode_ManualRestart(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		return isClusterOK(t.Context(), client)
-	}, 15*time.Second, 500*time.Millisecond)
+	}, 10*time.Second, 500*time.Millisecond)
 }
 
 func TestPauseNode(t *testing.T) {
-	cluster, err := rediscluster.Run(t.Context(), defaultImage)
+	cluster, err := rediscluster.Run(t.Context(), defaultImage, testOpts()...)
 	require.NoError(t, err)
 	t.Cleanup(func() { testcontainers.CleanupContainer(t, cluster) })
 
@@ -181,7 +201,7 @@ func TestPauseNode(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		return isClusterOK(t.Context(), client)
-	}, 15*time.Second, 500*time.Millisecond)
+	}, 10*time.Second, 500*time.Millisecond)
 }
 
 // TestNodeTemporarilyOffline simulates a node going offline for an extended period
@@ -189,7 +209,7 @@ func TestPauseNode(t *testing.T) {
 // continue against the remaining cluster, then verifies that all data is intact
 // once the node rejoins and the cluster fully heals.
 func TestNodeTemporarilyOffline(t *testing.T) {
-	cluster, err := rediscluster.Run(t.Context(), defaultImage)
+	cluster, err := rediscluster.Run(t.Context(), defaultImage, testOpts()...)
 	require.NoError(t, err)
 	t.Cleanup(func() { testcontainers.CleanupContainer(t, cluster) })
 
@@ -210,22 +230,21 @@ func TestNodeTemporarilyOffline(t *testing.T) {
 	restartFn, err := cluster.StopNode(t.Context(), 0, 0)
 	require.NoError(t, err)
 
-	// Wait for the cluster to elect a new master before writing. Until failover
-	// completes, writes to the affected slots will fail regardless of slot map state.
+	// Wait for the replica to be promoted and all slots to be healthy again.
+	// With cluster-node-timeout 1s and replica-validity-factor 0, failover
+	// completes so quickly that the transient degraded state (slots_ok < 16384)
+	// is not reliably observable via polling.
 	require.Eventually(t, func() bool {
 		return isClusterOK(t.Context(), client)
-	}, 15*time.Second, 200*time.Millisecond)
+	}, 10*time.Second, 200*time.Millisecond)
+
+	// Force the client to refresh its slot map so it learns about the promoted replica.
+	client.ReloadState(t.Context())
 
 	// The cluster should continue accepting writes while the original node is still down.
-	// The first write may fail with EOF if the client's slot map still points to the
-	// dead node; LazyReload runs async so require.Eventually absorbs the brief delay.
 	for i := range keyCount {
-		i := i
-		key := fmt.Sprintf("during-%d", i)
-		val := fmt.Sprintf("val-%d", i)
-		require.Eventually(t, func() bool {
-			return client.Set(t.Context(), key, val, 0).Err() == nil
-		}, 10*time.Second, 200*time.Millisecond)
+		err = client.Set(t.Context(), fmt.Sprintf("during-%d", i), fmt.Sprintf("val-%d", i), 0).Err()
+		require.NoError(t, err)
 	}
 
 	// Bring the node back online.
@@ -234,7 +253,7 @@ func TestNodeTemporarilyOffline(t *testing.T) {
 	// Wait for the cluster to fully heal before asserting data.
 	require.Eventually(t, func() bool {
 		return isClusterOK(t.Context(), client)
-	}, 30*time.Second, 500*time.Millisecond)
+	}, 15*time.Second, 500*time.Millisecond)
 
 	// All data written before and during the outage must be readable.
 	for i := range keyCount {

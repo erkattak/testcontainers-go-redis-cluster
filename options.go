@@ -9,28 +9,30 @@ import (
 )
 
 type options struct {
-	masters             int
-	replicasPerMaster   int
-	image               string
-	password            string
-	clusterNodeTimeout  time.Duration
-	appendOnly          bool
-	maxMemory           string
-	maxMemoryPolicy     string
-	logLevel            string
-	allowReadsWhenDown  bool
-	allowWritesWhenDown bool
-	requireFullCoverage bool
-	replicaNoFailover   bool
+	masters                      int
+	replicasPerMaster            int
+	image                        string
+	password                     string
+	clusterNodeTimeout           time.Duration
+	appendOnly                   bool
+	maxMemory                    string
+	maxMemoryPolicy              string
+	logLevel                     string
+	clusterAllowReadsWhenDown    bool
+	clusterAllowWritesWhenDown   bool
+	clusterRequireFullCoverage   bool
+	clusterReplicaNoFailover     bool
+	clusterMigrationBarrier      *int
+	clusterReplicaValidityFactor *int
 }
 
 func defaultOptions() options {
 	return options{
-		masters:             3,
-		replicasPerMaster:   1,
-		image:               "redis:alpine",
-		clusterNodeTimeout:  1000 * time.Millisecond,
-		requireFullCoverage: true,
+		masters:                    3,
+		replicasPerMaster:          1,
+		image:                      "redis:alpine",
+		clusterNodeTimeout:         1000 * time.Millisecond,
+		clusterRequireFullCoverage: true,
 	}
 }
 
@@ -60,17 +62,23 @@ func (o options) buildNodeConf(port int) string {
 	if o.logLevel != "" {
 		fmt.Fprintf(&b, "loglevel %s\n", o.logLevel)
 	}
-	if o.allowReadsWhenDown {
+	if o.clusterAllowReadsWhenDown {
 		fmt.Fprintf(&b, "cluster-allow-reads-when-down yes\n")
 	}
-	if o.allowWritesWhenDown {
+	if o.clusterAllowWritesWhenDown {
 		fmt.Fprintf(&b, "cluster-allow-writes-when-down yes\n")
 	}
-	if !o.requireFullCoverage {
+	if !o.clusterRequireFullCoverage {
 		fmt.Fprintf(&b, "cluster-require-full-coverage no\n")
 	}
-	if o.replicaNoFailover {
+	if o.clusterReplicaNoFailover {
 		fmt.Fprintf(&b, "cluster-replica-no-failover yes\n")
+	}
+	if o.clusterMigrationBarrier != nil {
+		fmt.Fprintf(&b, "cluster-migration-barrier %d\n", *o.clusterMigrationBarrier)
+	}
+	if o.clusterReplicaValidityFactor != nil {
+		fmt.Fprintf(&b, "cluster-replica-validity-factor %d\n", *o.clusterReplicaValidityFactor)
 	}
 	if o.password != "" {
 		fmt.Fprintf(&b, "requirepass %s\n", o.password)
@@ -133,29 +141,46 @@ func WithLogLevel(level string) testcontainers.ContainerCustomizer {
 	return clusterOption{apply: func(o *options) { o.logLevel = level }}
 }
 
-// WithAllowReadsWhenDown allows replica nodes to serve stale reads even when
+// WithClusterAllowReadsWhenDown allows replica nodes to serve stale reads even when
 // the cluster is in a degraded state. Useful for testing read behaviour during
 // partial outages.
-func WithAllowReadsWhenDown() testcontainers.ContainerCustomizer {
-	return clusterOption{apply: func(o *options) { o.allowReadsWhenDown = true }}
+func WithClusterAllowReadsWhenDown() testcontainers.ContainerCustomizer {
+	return clusterOption{apply: func(o *options) { o.clusterAllowReadsWhenDown = true }}
 }
 
-// WithAllowWritesWhenDown allows nodes to accept writes even when the cluster
+// WithClusterAllowWritesWhenDown allows nodes to accept writes even when the cluster
 // is in a degraded state. Requires Redis 7+.
-func WithAllowWritesWhenDown() testcontainers.ContainerCustomizer {
-	return clusterOption{apply: func(o *options) { o.allowWritesWhenDown = true }}
+func WithClusterAllowWritesWhenDown() testcontainers.ContainerCustomizer {
+	return clusterOption{apply: func(o *options) { o.clusterAllowWritesWhenDown = true }}
 }
 
-// WithoutFullCoverage disables the cluster-require-full-coverage check, so the
+// WithoutClusterRequireFullCoverage disables the cluster-require-full-coverage check, so the
 // cluster continues serving requests for covered slots even when some hash slots
 // are unassigned. Useful for testing degraded-cluster scenarios.
-func WithoutFullCoverage() testcontainers.ContainerCustomizer {
-	return clusterOption{apply: func(o *options) { o.requireFullCoverage = false }}
+func WithoutClusterRequireFullCoverage() testcontainers.ContainerCustomizer {
+	return clusterOption{apply: func(o *options) { o.clusterRequireFullCoverage = false }}
 }
 
-// WithReplicaNoFailover prevents replicas from automatically promoting to master
+// WithClusterReplicaNoFailover prevents replicas from automatically promoting to master
 // when a master fails. Useful for fault-injection tests where failover should be
 // triggered manually.
-func WithReplicaNoFailover() testcontainers.ContainerCustomizer {
-	return clusterOption{apply: func(o *options) { o.replicaNoFailover = true }}
+func WithClusterReplicaNoFailover() testcontainers.ContainerCustomizer {
+	return clusterOption{apply: func(o *options) { o.clusterReplicaNoFailover = true }}
+}
+
+// WithClusterMigrationBarrier sets the minimum number of replicas a master must
+// retain before one of its replicas can be migrated to an orphaned master
+// (cluster-migration-barrier). The Redis default is 1. Setting a higher value
+// makes automatic replica migration less aggressive.
+func WithClusterMigrationBarrier(n int) testcontainers.ContainerCustomizer {
+	return clusterOption{apply: func(o *options) { o.clusterMigrationBarrier = &n }}
+}
+
+// WithClusterReplicaValidityFactor controls whether a replica that has been disconnected
+// from its master for an extended period is still eligible to failover
+// (cluster-replica-validity-factor). A value of 0 means replicas are always
+// eligible regardless of disconnection time, which is the typical production
+// setting for maximising availability.
+func WithClusterReplicaValidityFactor(n int) testcontainers.ContainerCustomizer {
+	return clusterOption{apply: func(o *options) { o.clusterReplicaValidityFactor = &n }}
 }
