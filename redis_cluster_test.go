@@ -414,6 +414,107 @@ func TestAddrMapping(t *testing.T) {
 	assert.NotContains(t, mapping2, "test")
 }
 
+func TestReplicaForMaster(t *testing.T) {
+	cluster, err := rediscluster.Run(t.Context(), defaultImage, testOpts()...)
+	require.NoError(t, err)
+	t.Cleanup(func() { testcontainers.CleanupContainer(t, cluster) })
+
+	// Default: 3 masters (indices 0,1,2) each with 1 replica (indices 3,4,5)
+	for masterIdx := range 3 {
+		replicaIdx, err := cluster.ReplicaForMaster(t.Context(), masterIdx)
+		require.NoError(t, err)
+		assert.GreaterOrEqual(t, replicaIdx, 3, "replica index should be >= 3")
+		assert.Less(t, replicaIdx, 6, "replica index should be < 6")
+	}
+
+	// Invalid master index returns error
+	_, err = cluster.ReplicaForMaster(t.Context(), 99)
+	require.Error(t, err)
+
+	// Replica index (not a master) returns error
+	_, err = cluster.ReplicaForMaster(t.Context(), 3)
+	require.Error(t, err)
+}
+
+// TestPreFreezePattern demonstrates how to use pre-freezing to create a controlled
+// timing window during failover. This pattern is useful for testing scenarios that
+// require observing intermediate states during migration/resubscription.
+//
+// The key insight: by freezing the replica BEFORE stopping the master, the client's
+// attempt to reconnect to the promoted replica will hang, giving tests time to
+// observe the "migration detected but not yet resubscribed" state.
+//
+// Usage pattern for consumer tests:
+//
+//	replicaIdx, _ := cluster.ReplicaForMaster(ctx, masterIdx)
+//	resume, _ := cluster.PauseNode(ctx, replicaIdx, 0)  // Pre-freeze replica
+//	cluster.StopNode(ctx, masterIdx, 0)                  // Trigger failover
+//	// ... observe intermediate state, run assertions ...
+//	resume()                                             // Allow resubscription
+func TestPreFreezePattern(t *testing.T) {
+	cluster, err := rediscluster.Run(t.Context(), defaultImage, testOpts()...)
+	require.NoError(t, err)
+	t.Cleanup(func() { testcontainers.CleanupContainer(t, cluster) })
+
+	client := newClient(t, cluster)
+	defer func() {
+		require.NoError(t, client.Close())
+	}()
+
+	// Write data across multiple slots before failover.
+	for i := range 10 {
+		key := fmt.Sprintf("prefreeze-key-%d", i)
+		err = client.Set(t.Context(), key, "value", 0).Err()
+		require.NoError(t, err)
+	}
+
+	// Step 1: Identify which replica will be promoted when master 0 fails.
+	replicaIdx, err := cluster.ReplicaForMaster(t.Context(), 0)
+	require.NoError(t, err)
+	t.Logf("Replica for master 0 is node %d", replicaIdx)
+
+	// Step 2: Pre-freeze the replica. It's still a replica, so the cluster doesn't
+	// care that it's frozen. But when promoted, clients won't be able to use slots
+	// owned by that master until it's resumed.
+	resumeReplica, err := cluster.PauseNode(t.Context(), replicaIdx, 0)
+	require.NoError(t, err)
+
+	// Step 3: Stop the master to trigger failover.
+	_, err = cluster.StopNode(t.Context(), 0, 0)
+	require.NoError(t, err)
+
+	// At this point:
+	// - Master 0 is stopped
+	// - The cluster will promote the replica
+	// - But the promoted replica is frozen (SIGSTOP)
+	// - Client attempts to access master 0's former slots will hang or fail
+	//
+	// This is the window where tests can observe "migration detected, resubscription pending".
+	// Consumer tests would add their specific assertions here.
+
+	t.Log("Master stopped and replica frozen - this is the timing window for assertions")
+
+	// Step 4: Resume the replica (now master) to complete resubscription.
+	err = resumeReplica()
+	require.NoError(t, err)
+	t.Log("Replica resumed")
+
+	// Step 5: Verify the cluster recovers and data is accessible.
+	require.Eventually(t, func() bool {
+		return isClusterOK(t.Context(), client)
+	}, 15*time.Second, 500*time.Millisecond)
+
+	client.ReloadState(t.Context())
+
+	// Verify all data is still accessible after recovery.
+	for i := range 10 {
+		key := fmt.Sprintf("prefreeze-key-%d", i)
+		got, err := client.Get(t.Context(), key).Result()
+		require.NoError(t, err)
+		assert.Equal(t, "value", got)
+	}
+}
+
 // clusterInfo runs CLUSTER INFO and parses the result into a key-value map.
 func clusterInfo(t *testing.T, client *redis.ClusterClient) map[string]string {
 	t.Helper()

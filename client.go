@@ -134,6 +134,114 @@ func (c *Container) MasterNodes(ctx context.Context) ([]NodeInfo, error) {
 	return masters, nil
 }
 
+// ReplicaForMaster returns the node index of a replica that replicates the given
+// master node, based on current cluster topology. Returns an error if no replica
+// is found or if the master index is invalid.
+//
+// This is useful for fault injection tests that need to pre-freeze a replica
+// before triggering a failover. By freezing the replica first, then stopping
+// the master, tests can observe the intermediate state where migration has been
+// detected but resubscription is blocked.
+func (c *Container) ReplicaForMaster(ctx context.Context, masterIndex int) (int, error) {
+	if masterIndex < 0 || masterIndex >= c.nodeCount {
+		return -1, fmt.Errorf("master index %d out of range [0, %d)", masterIndex, c.nodeCount)
+	}
+
+	// Get CLUSTER NODES output to find the master's node ID and its replica.
+	var output []byte
+	var lastErr error
+	for i := range c.nodeCount {
+		args := []string{"redis-cli", "-p", fmt.Sprintf("%d", initialPort+i)}
+		if c.opts.password != "" {
+			args = append(args, "-a", c.opts.password)
+		}
+		args = append(args, "CLUSTER", "NODES")
+
+		code, reader, err := c.Exec(ctx, args)
+		if err != nil || code != 0 {
+			lastErr = fmt.Errorf("node %d: CLUSTER NODES failed", i)
+			continue
+		}
+
+		output, err = io.ReadAll(reader)
+		if err != nil {
+			lastErr = fmt.Errorf("node %d: reading output: %w", i, err)
+			continue
+		}
+		lastErr = nil
+		break
+	}
+	if lastErr != nil {
+		return -1, fmt.Errorf("all nodes failed, last error: %w", lastErr)
+	}
+
+	// Parse CLUSTER NODES to build addr->nodeID and nodeID->masterID maps.
+	// Format: <id> <ip:port@cport> <flags> <master-id|-> ...
+	type nodeEntry struct {
+		id       string
+		addr     string
+		isMaster bool
+		masterID string // for replicas, the ID of their master
+	}
+	entries := make(map[string]nodeEntry) // addr -> entry
+
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		addr := strings.Split(fields[1], "@")[0]
+		flags := fields[2]
+		masterID := fields[3]
+
+		entries[addr] = nodeEntry{
+			id:       fields[0],
+			addr:     addr,
+			isMaster: strings.Contains(flags, "master"),
+			masterID: masterID,
+		}
+	}
+
+	// Build a port -> entry lookup since CLUSTER NODES may use different IPs.
+	portEntries := make(map[int]nodeEntry)
+	for addr, entry := range entries {
+		// Extract port from addr (format: "ip:port")
+		parts := strings.Split(addr, ":")
+		if len(parts) != 2 {
+			continue
+		}
+		port := 0
+		fmt.Sscanf(parts[1], "%d", &port)
+		if port >= initialPort && port < initialPort+c.nodeCount {
+			portEntries[port] = entry
+		}
+	}
+
+	// Find the master's node ID.
+	masterPort := initialPort + masterIndex
+	masterEntry, ok := portEntries[masterPort]
+	if !ok {
+		return -1, fmt.Errorf("master at index %d (port %d) not found in cluster", masterIndex, masterPort)
+	}
+	if !masterEntry.isMaster {
+		return -1, fmt.Errorf("node at index %d is not a master", masterIndex)
+	}
+
+	// Find a replica whose masterID matches.
+	for i := range c.nodeCount {
+		port := initialPort + i
+		entry, ok := portEntries[port]
+		if !ok {
+			continue
+		}
+		if !entry.isMaster && entry.masterID == masterEntry.id {
+			return i, nil
+		}
+	}
+
+	return -1, fmt.Errorf("no replica found for master at index %d", masterIndex)
+}
+
 // AddrMapping returns a map from internal addresses (as announced by Redis)
 // to their corresponding host-accessible external addresses.
 func (c *Container) AddrMapping() map[string]string {
