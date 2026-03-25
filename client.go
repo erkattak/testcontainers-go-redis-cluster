@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"time"
 )
 
 // NodeInfo describes a single Redis cluster node.
@@ -147,6 +148,33 @@ func (c *Container) ReplicaForMaster(ctx context.Context, masterIndex int) (int,
 		return -1, fmt.Errorf("master index %d out of range [0, %d)", masterIndex, c.nodeCount)
 	}
 
+	// The cluster topology may take a moment to fully propagate after startup.
+	// Retry a few times if we can't find a replica.
+	var lastErr error
+	for attempt := range 10 {
+		replicaIdx, err := c.findReplicaForMaster(ctx, masterIndex)
+		if err == nil {
+			return replicaIdx, nil
+		}
+		lastErr = err
+
+		// Only retry for "no replica found" errors, not for other errors.
+		if !strings.Contains(err.Error(), "no replica found") {
+			return -1, err
+		}
+
+		if attempt < 9 {
+			select {
+			case <-ctx.Done():
+				return -1, ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+	}
+	return -1, lastErr
+}
+
+func (c *Container) findReplicaForMaster(ctx context.Context, masterIndex int) (int, error) {
 	// Get CLUSTER NODES output to find the master's node ID and its replica.
 	var output []byte
 	var lastErr error
@@ -186,16 +214,20 @@ func (c *Container) ReplicaForMaster(ctx context.Context, masterIndex int) (int,
 	entries := make(map[string]nodeEntry) // addr -> entry
 
 	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
 		fields := strings.Fields(line)
 		if len(fields) < 4 {
 			continue
 		}
+		// Node IDs are 40-char hex strings. Extract only hex characters to avoid
+		// issues with terminal control codes or other garbage in the output.
+		nodeID := extractHexID(fields[0])
 		addr := strings.Split(fields[1], "@")[0]
 		flags := fields[2]
-		masterID := fields[3]
+		masterID := extractHexID(fields[3])
 
 		entries[addr] = nodeEntry{
-			id:       fields[0],
+			id:       nodeID,
 			addr:     addr,
 			isMaster: strings.Contains(flags, "master"),
 			masterID: masterID,
@@ -211,7 +243,10 @@ func (c *Container) ReplicaForMaster(ctx context.Context, masterIndex int) (int,
 			continue
 		}
 		port := 0
-		fmt.Sscanf(parts[1], "%d", &port)
+		_, err := fmt.Sscanf(parts[1], "%d", &port)
+		if err != nil {
+			return -1, fmt.Errorf("invalid port in addr %s: %w", addr, err)
+		}
 		if port >= initialPort && port < initialPort+c.nodeCount {
 			portEntries[port] = entry
 		}
@@ -240,6 +275,23 @@ func (c *Container) ReplicaForMaster(ctx context.Context, masterIndex int) (int,
 	}
 
 	return -1, fmt.Errorf("no replica found for master at index %d", masterIndex)
+}
+
+// extractHexID extracts a 40-character hex ID from a string, filtering out
+// any terminal control codes or other non-hex characters that may appear in
+// container exec output. Returns "-" if the input is "-" (for master nodes).
+func extractHexID(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "-" {
+		return "-"
+	}
+	var result strings.Builder
+	for _, r := range s {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+			result.WriteRune(r)
+		}
+	}
+	return result.String()
 }
 
 // AddrMapping returns a map from internal addresses (as announced by Redis)

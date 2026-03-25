@@ -422,7 +422,7 @@ func TestReplicaForMaster(t *testing.T) {
 	// Default: 3 masters (indices 0,1,2) each with 1 replica (indices 3,4,5)
 	for masterIdx := range 3 {
 		replicaIdx, err := cluster.ReplicaForMaster(t.Context(), masterIdx)
-		require.NoError(t, err)
+		require.NoError(t, err, "failed for master %d", masterIdx)
 		assert.GreaterOrEqual(t, replicaIdx, 3, "replica index should be >= 3")
 		assert.Less(t, replicaIdx, 6, "replica index should be < 6")
 	}
